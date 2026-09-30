@@ -184,39 +184,6 @@ GRANT SELECT ON TABLE settings TO anon;      -- Allow anonymous Read for setting
 -- Grant usage on auth schema (needed for auth.uid() and auth.role())
 GRANT USAGE ON SCHEMA auth TO authenticated;
 
--- Create a trigger function to automatically create users in public.users table
-CREATE OR REPLACE FUNCTION public.handle_new_user()
-RETURNS TRIGGER AS $$
-BEGIN
-  -- Extract username from email if it follows the pattern username@pos-system.local
-  -- Handle potential conflicts by updating existing records
-  INSERT INTO public.users (id, email, username, role)
-  VALUES (
-    NEW.id, 
-    NEW.email, 
-    CASE 
-      WHEN NEW.email LIKE '%@pos-system.local' THEN 
-        SPLIT_PART(NEW.email, '@', 1)
-      ELSE 
-        NULL
-    END,
-    'cashier'
-  )
-  ON CONFLICT (id) DO UPDATE SET
-    email = EXCLUDED.email,
-    username = EXCLUDED.username,
-    role = EXCLUDED.role;
-  
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-
--- Create the trigger for new users
-DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
-CREATE TRIGGER on_auth_user_created
-  AFTER INSERT ON auth.users
-  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
-
 -- Add a function to safely check user roles
 CREATE OR REPLACE FUNCTION public.is_user_admin(user_id UUID)
 RETURNS BOOLEAN AS $$

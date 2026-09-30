@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { usePathname } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
 import { Button } from '@/components/ui/Button';
@@ -16,6 +16,7 @@ const navItems = [
     { name: 'Cashiers', href: '/admin/cashiers' },
     { name: 'Reports', href: '/admin/reports' },
     { name: 'Settings', href: '/admin/settings' },
+    { name: 'Approvals', href: '/admin/approvals' },
 ];
 
 export function AdminNavbar() {
@@ -28,10 +29,36 @@ export function AdminNavbar() {
     const [isDetailModalOpen, setIsDetailModalOpen] = useState(false);
     const searchRef = useRef<HTMLDivElement>(null);
     const pathname = usePathname();
+    const [pendingApprovals, setPendingApprovals] = useState(0);
 
     useEffect(() => {
         fetchCustomers();
     }, []);
+
+    // Live pending count so the admin sees the BIR manual queue is waiting
+    const fetchPendingApprovals = useCallback(async () => {
+        try {
+            const { count, error } = await supabase
+                .from('manual_entry_requests')
+                .select('id', { count: 'exact', head: true })
+                .eq('status', 'pending');
+            if (error) throw error;
+            setPendingApprovals(count || 0);
+        } catch (error) {
+            console.error('[ApprovalsBadge] Error fetching pending count:', error);
+        }
+    }, []);
+
+    useEffect(() => {
+        fetchPendingApprovals();
+        // Refresh whenever the admin navigates to or away from the queue
+    }, [pathname, fetchPendingApprovals]);
+
+    // Keep the badge live while the admin sits on other pages
+    useEffect(() => {
+        const interval = setInterval(fetchPendingApprovals, 60000);
+        return () => clearInterval(interval);
+    }, [fetchPendingApprovals]);
 
     useEffect(() => {
         const handleClickOutside = (e: MouseEvent) => {
@@ -112,6 +139,11 @@ export function AdminNavbar() {
                                             }`}
                                     >
                                         {item.name}
+                                        {item.name === 'Approvals' && pendingApprovals > 0 && (
+                                            <span className="ml-1.5 inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 rounded-full bg-amber-500 text-white text-[10px] font-black">
+                                                {pendingApprovals}
+                                            </span>
+                                        )}
                                     </a>
                                 ))}
                             </div>
@@ -218,7 +250,14 @@ export function AdminNavbar() {
                                 }`}
                             onClick={() => setIsMobileMenuOpen(false)}
                         >
-                            {item.name}
+                            <span className="flex items-center justify-between">
+                                {item.name}
+                                {item.name === 'Approvals' && pendingApprovals > 0 && (
+                                    <span className="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 rounded-full bg-amber-500 text-white text-[10px] font-black">
+                                        {pendingApprovals}
+                                    </span>
+                                )}
+                            </span>
                         </a>
                     ))}
                     <div className="pt-4 mt-4 border-t border-gray-200 dark:border-gray-700">

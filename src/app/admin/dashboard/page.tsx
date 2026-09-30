@@ -3,6 +3,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabaseClient';
 import { Card, CardContent, CardHeader } from '@/components/ui/Card';
+import { Button } from '@/components/ui/Button';
 import { useCurrency } from '@/context/CurrencyContext';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Badge } from '@/components/ui/badge';
@@ -16,26 +17,32 @@ import {
   Clock,
   ShoppingCart,
   ShieldCheck,
-  AlertCircle
+  AlertCircle,
+  FileText,
+  RefreshCw
 } from 'lucide-react';
 
 export default function AdminDashboard() {
   const { formatPrice } = useCurrency();
   const [stats, setStats] = useState({
     totalRevenue: 0,
+    registerRevenue: 0,
+    manualRevenue: 0,
     productCount: 0,
     cashierCount: 0,
-    todaySales: 0
+    todaySales: 0,
+    pendingManual: 0
   });
   const [recentActivity, setRecentActivity] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => {
     fetchDashboardData();
   }, []);
 
-  const fetchDashboardData = async () => {
-    setLoading(true);
+  const fetchDashboardData = async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const today = new Date();
       today.setHours(0, 0, 0, 0);
@@ -46,24 +53,39 @@ export default function AdminDashboard() {
         { data: allTransactions },
         { data: todayTransactions },
         { data: activityLogs },
-        { data: latestTransactionsData }
+        { data: latestTransactionsData },
+        { count: pendingManualCount }
       ] = await Promise.all([
         supabase.from('products').select('*', { count: 'exact', head: true }).is('deleted_at', null),
         supabase.from('cashiers').select('*', { count: 'exact', head: true }).is('deleted_at', null),
-        supabase.from('transactions').select('total_amount'),
-        supabase.from('transactions').select('total_amount').gte('created_at', today.toISOString()),
+        supabase.from('transactions').select('total_amount, source').eq('status', 'completed').is('voided_at', null),
+        supabase
+          .from('transactions')
+          .select('total_amount, source')
+          .eq('status', 'completed')
+          .is('voided_at', null)
+          .gte('transaction_date', today.toISOString().slice(0, 10)),
         supabase.from('activity_logs').select('*, users(email)').order('created_at', { ascending: false }).limit(5),
-        supabase.from('transactions').select('*').order('created_at', { ascending: false }).limit(5)
+        supabase.from('transactions').select('*').order('created_at', { ascending: false }).limit(5),
+        supabase.from('manual_entry_requests').select('id', { count: 'exact', head: true }).eq('status', 'pending')
       ]);
 
+      // Manual entries are back-filled onto their BIR date, so they can land in a
+      // different day than the POS register total. Keep the two streams separate
+      // and expose both instead of silently merging them.
       const totalRevenue = allTransactions?.reduce((sum, t) => sum + Number(t.total_amount || 0), 0) || 0;
+      const registerRevenue = allTransactions?.reduce((sum, t) => sum + (t.source === 'manual' ? 0 : Number(t.total_amount || 0)), 0) || 0;
+      const manualRevenue = allTransactions?.reduce((sum, t) => sum + (t.source === 'manual' ? Number(t.total_amount || 0) : 0), 0) || 0;
       const todaySales = todayTransactions?.reduce((sum, t) => sum + Number(t.total_amount || 0), 0) || 0;
 
       setStats({
         totalRevenue,
+        registerRevenue,
+        manualRevenue,
         productCount: productCount || 0,
         cashierCount: cashierCount || 0,
-        todaySales
+        todaySales,
+        pendingManual: pendingManualCount || 0
       });
 
       // Pre-fetch names for mapping
@@ -103,6 +125,16 @@ export default function AdminDashboard() {
     }
   };
 
+  const handleRefresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      await fetchDashboardData(true);
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
   return (
     <div className="space-y-8 max-w-7xl mx-auto p-4 md:p-6 animate-fade-in">
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
@@ -115,9 +147,21 @@ export default function AdminDashboard() {
             Real-time business insights and terminal activity.
           </p>
         </div>
-        <Badge variant="outline" className="px-3 py-1 bg-green-50 text-green-700 border-green-200 dark:bg-green-900/20 dark:text-green-400 dark:border-green-800 animate-pulse">
-          System Live
-        </Badge>
+        <div className="flex items-center gap-3">
+          <Badge variant="outline" className="px-3 py-1 bg-green-50 text-green-700 border-green-200 dark:bg-green-900/20 dark:text-green-400 dark:border-green-800 animate-pulse">
+            System Live
+          </Badge>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleRefresh}
+            disabled={refreshing}
+            className="rounded-lg"
+          >
+            <RefreshCw className={`h-4 w-4 mr-1 ${refreshing ? 'animate-spin' : ''}`} />
+            Refresh
+          </Button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-4">
@@ -125,7 +169,7 @@ export default function AdminDashboard() {
           title="Lifetime Revenue"
           value={formatPrice(stats.totalRevenue)}
           icon={<PhilippinePeso className="h-5 w-5 text-green-600" />}
-          trend="+8.2% all-time"
+          trend="Register + Manual Book"
           trendUp
           loading={loading}
         />
@@ -150,6 +194,49 @@ export default function AdminDashboard() {
           trend="Authorized"
           loading={loading}
         />
+      </div>
+
+      <div className="grid grid-cols-1 gap-6 sm:grid-cols-3">
+        <Card className="border-blue-100 dark:border-blue-900/50 shadow-sm">
+          <CardContent className="pt-6 flex items-center justify-between">
+            <div>
+              <p className="text-xs font-black uppercase tracking-wider text-muted-foreground">Register Sales</p>
+              <p className="text-2xl font-black text-blue-600 mt-1">
+                {loading ? '—' : formatPrice(stats.registerRevenue)}
+              </p>
+            </div>
+            <ShoppingCart className="h-8 w-8 text-blue-500/30" />
+          </CardContent>
+        </Card>
+        <Card className="border-amber-100 dark:border-amber-900/50 shadow-sm">
+          <CardContent className="pt-6 flex items-center justify-between">
+            <div>
+              <p className="text-xs font-black uppercase tracking-wider text-muted-foreground">Manual Book Sales</p>
+              <p className="text-2xl font-black text-amber-600 mt-1">
+                {loading ? '—' : formatPrice(stats.manualRevenue)}
+              </p>
+            </div>
+            <FileText className="h-8 w-8 text-amber-500/30" />
+          </CardContent>
+        </Card>
+        <a href="/admin/approvals" className="block">
+          <Card className="border-amber-200 dark:border-amber-800 shadow-sm hover:shadow-md transition-shadow cursor-pointer h-full">
+            <CardContent className="pt-6 flex items-center justify-between">
+              <div>
+                <p className="text-xs font-black uppercase tracking-wider text-muted-foreground">Pending Approvals</p>
+                <p className="text-2xl font-black text-amber-700 mt-1">
+                  {loading ? '—' : stats.pendingManual}
+                </p>
+                <p className="text-[10px] font-bold text-muted-foreground mt-0.5">
+                  {stats.pendingManual > 0 ? 'Waiting for review' : 'Queue is clear'}
+                </p>
+              </div>
+              <AlertCircle
+                className={`h-8 w-8 ${stats.pendingManual > 0 ? 'text-amber-500 animate-pulse' : 'text-green-500/30'}`}
+              />
+            </CardContent>
+          </Card>
+        </a>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">

@@ -50,6 +50,7 @@ import {
 } from 'lucide-react';
 import { PrintableReceipt } from '@/components/ui/PrintableReceipt';
 import { DailyReportModal } from '@/components/cashier/DailyReportModal';
+import { ManualEntryModal } from '@/components/cashier/ManualEntryModal';
 
 interface Product {
   id: string;
@@ -74,6 +75,8 @@ export default function CashierPOS() {
   const [isReceiptModalOpen, setIsReceiptModalOpen] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
   const [isDailyReportOpen, setIsDailyReportOpen] = useState(false);
+  const [isManualEntryOpen, setIsManualEntryOpen] = useState(false); // BIR manual sales book entry
+  const [pendingManualCount, setPendingManualCount] = useState(0);
   const [isCartOpen, setIsCartOpen] = useState(false); // For mobile cart drawer
   const [paymentMethod, setPaymentMethod] = useState<'cash' | 'card' | 'mobile' | 'cheque' | 'term'>('cash');
   const [amountReceived, setAmountReceived] = useState('');
@@ -169,6 +172,7 @@ export default function CashierPOS() {
     // Fetch products and settings from Supabase
     fetchProducts();
     fetchSettings();
+    fetchPendingManualCount();
 
     // Set up real-time listener for product updates
     const channel = supabase
@@ -240,12 +244,33 @@ export default function CashierPOS() {
   const fetchSettings = async () => {
     try {
       const { data, error } = await supabaseDB.getSettings();
-      if (error) throw new Error(error);
+      if (error) throw error;
       setSettings(data);
     } catch (error: any) {
       console.error('Error fetching settings:', error);
     }
   };
+
+  // Badge count for the MANUAL button so the cashier can see if the admin has
+  // cleared their queue. Manual entries are kept entirely out of the register
+  // flow, so this must never touch totals, stock, or the EOD report.
+  // Cashiers hold the anon key with no Auth session, so this goes through the
+  // RPC rather than a direct read of manual_entry_requests.
+  const fetchPendingManualCount = useCallback(async () => {
+    try {
+      const cashierId = typeof window !== 'undefined' ? sessionStorage.getItem('cashier_id') : null;
+      if (!cashierId) return;
+      const { data, error } = await supabase.rpc('list_manual_entry_requests', {
+        p_cashier_id: cashierId,
+        p_status: 'pending',
+      });
+      if (error) throw error;
+      const rows = (data as unknown[]) || [];
+      setPendingManualCount(rows.length);
+    } catch (err) {
+      console.error('Error fetching pending manual entry count:', err);
+    }
+  }, []);
 
   const handleSignOut = useCallback(async () => {
     try {
@@ -659,7 +684,9 @@ export default function CashierPOS() {
         .from('transactions')
         .select('term_remaining_balance, term_paid_amount')
         .eq('customer_id', customer.id)
-        .eq('payment_method', 'term');
+        .eq('payment_method', 'term')
+        .eq('status', 'completed')
+        .is('voided_at', null);
       if (error) throw error;
       const totalOwed = (data || []).reduce((sum, tx) => {
         return sum + ((tx.term_remaining_balance || 0) - (tx.term_paid_amount || 0));
@@ -696,10 +723,12 @@ export default function CashierPOS() {
     try {
       const { data, error } = await supabase
         .from('transactions')
-        .select('id, total_amount, term_remaining_balance, term_paid_amount, created_at')
+        .select('id, total_amount, term_remaining_balance, term_paid_amount, created_at, transaction_date, source')
         .eq('customer_id', customer.id)
         .eq('payment_method', 'term')
-        .order('created_at', { ascending: true });
+        .eq('status', 'completed')
+        .is('voided_at', null)
+        .order('transaction_date', { ascending: true });
       if (error) throw error;
       const outstanding = (data || []).filter(tx => {
         const paid = tx.term_paid_amount || 0;
@@ -720,7 +749,9 @@ export default function CashierPOS() {
           total_amount: override,
           term_remaining_balance: override,
           term_paid_amount: 0,
-          created_at: new Date().toISOString()
+          created_at: new Date().toISOString(),
+          transaction_date: new Date().toISOString().split('T')[0],
+          source: 'register'
         });
       }
 
@@ -889,7 +920,9 @@ export default function CashierPOS() {
           .from('transactions')
           .select('term_remaining_balance, term_paid_amount')
           .eq('customer_id', c.id)
-          .eq('payment_method', 'term');
+          .eq('payment_method', 'term')
+          .eq('status', 'completed')
+          .is('voided_at', null);
         const termBalance = (txs || []).reduce((sum, tx) => {
           return sum + ((tx.term_remaining_balance || 0) - (tx.term_paid_amount || 0));
         }, 0);
@@ -1023,6 +1056,7 @@ export default function CashierPOS() {
             <Button onClick={() => setIsDailyReportOpen(true)} variant="outline" size="sm" className="font-bold text-xs flex items-center gap-2 border-dashed border-primary/50 text-primary hover:bg-primary/10"><FileText className="h-4 w-4 hidden md:block" /> DAILY REPORT</Button>
             <Button onClick={() => {setIsReceivePaymentOpen(true); setRpCustomerName(''); setRpSelectedCustomer(null); setRpAmount(''); setRpOutstanding([]); setRpTxItems({}); setRpPreview([]); setRpNotes('');}} variant="outline" size="sm" className="font-bold text-xs flex items-center gap-2 border-dashed border-orange-500/50 text-orange-600 hover:bg-orange-50"><HandCoins className="h-4 w-4 hidden md:block" /> RECEIVE</Button>
             <Button onClick={() => { setIsCustomerListOpen(true); fetchCustomerList(); }} variant="outline" size="sm" className="font-bold text-xs flex items-center gap-2 border-dashed border-blue-500/50 text-blue-600 hover:bg-blue-50"><Users className="h-4 w-4 hidden md:block" /> CUSTOMERS</Button>
+            <Button onClick={() => setIsManualEntryOpen(true)} variant="outline" size="sm" className="font-bold text-xs flex items-center gap-2 border-dashed border-amber-500/50 text-amber-600 hover:bg-amber-50"><FileText className="h-4 w-4 hidden md:block" /> MANUAL{pendingManualCount > 0 ? ` (${pendingManualCount})` : ''}</Button>
             <Button onClick={handleSignOut} variant="destructive" size="sm" className="font-bold text-xs flex items-center gap-2"><LogOut className="h-4 w-4" /> LOGOUT</Button>
           </div>
         </header>
@@ -2068,6 +2102,16 @@ export default function CashierPOS() {
         onClose={() => setIsDailyReportOpen(false)} 
         cashierId={user?.cashier_id || null} 
         cashierName={user?.cashier_username || null} 
+      />
+
+      <ManualEntryModal
+        isOpen={isManualEntryOpen}
+        onClose={() => setIsManualEntryOpen(false)}
+        cashierId={user?.cashier_id || null}
+        cashierUsername={user?.cashier_username || null}
+        products={products}
+        taxRate={settings?.tax_rate || 12}
+        onSubmitted={fetchPendingManualCount}
       />
     </>
   );

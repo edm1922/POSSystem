@@ -69,9 +69,10 @@ export function CustomerDetailModal({ customer, isOpen, onClose }: CustomerDetai
     try {
       const { data, error } = await supabase
         .from('transactions')
-        .select('id, total_amount, payment_method, status, created_at')
+        .select('id, total_amount, payment_method, status, created_at, transaction_date, source, manual_ref')
         .eq('customer_id', customer.id)
-        .order('created_at', { ascending: true });
+        .is('voided_at', null)
+        .order('transaction_date', { ascending: true });
 
       if (error) throw error;
       setTransactions(data || []);
