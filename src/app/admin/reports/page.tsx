@@ -8,6 +8,7 @@ import { Table, TableHeader, TableBody, TableHead, TableRow, TableCell } from '@
 import { Button } from '@/components/ui/Button';
 import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
+import DownpaymentsSection from '@/components/admin/DownpaymentsSection';
 import {
   TrendingUp,
   ShoppingCart,
@@ -20,92 +21,121 @@ import {
   CreditCard,
   Banknote,
   CalendarDays,
-  HandCoins
+  HandCoins,
+  Smartphone,
+  ScrollText,
+  Layers
 } from 'lucide-react';
 
 interface Transaction {
   id: string;
   cashier_id: string;
+  recorded_by_cashier_id?: string;
   total_amount: number;
   down_payment?: number;
   payment_method: string;
   status?: string;
   created_at: string;
-  cashier?: { email: string };
+  transaction_date?: string;
+  source?: 'register' | 'manual';
+  manual_ref?: string;
+  voided_at?: string;
+  customer_id?: string;
   customer_name?: string;
   is_down_payment?: boolean;
+  cashier?: { email: string };
   transaction_items?: Array<{
     quantity: number;
+    item_name?: string;
     products?: { name: string };
   }>;
 }
 
 type DateRange = 'today' | 'week' | 'month' | 'year' | 'custom';
+type SourceFilter = 'combined' | 'register' | 'manual';
+
+// Shared window helper: the report ledger and the Down Payments monitor both
+// need the exact same period so their "collected" figures agree.
+function getReportWindow(
+  range: DateRange,
+  customStartDate: string,
+  customEndDate: string
+): { startIso: string; endIso: string | null } {
+  const now = new Date();
+  let startDate = new Date();
+  let endIso: string | null = null;
+
+  if (range === 'custom') {
+    const endDate = new Date(customEndDate);
+    endDate.setHours(23, 59, 59, 999);
+    startDate = new Date(customStartDate);
+    startDate.setHours(0, 0, 0, 0);
+    endIso = endDate.toISOString();
+  } else {
+    switch (range) {
+      case 'today':
+        startDate.setHours(0, 0, 0, 0);
+        break;
+      case 'week':
+        startDate.setDate(now.getDate() - 7);
+        break;
+      case 'month':
+        startDate.setMonth(now.getMonth() - 1);
+        break;
+      case 'year':
+        startDate.setFullYear(now.getFullYear() - 1);
+        break;
+    }
+  }
+
+  return { startIso: startDate.toISOString(), endIso };
+}
 
 export default function Reports() {
   const { formatPrice } = useCurrency();
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [dateRange, setDateRange] = useState<DateRange>('week');
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>('combined');
   const [customStartDate, setCustomStartDate] = useState(new Date().toISOString().split('T')[0]);
   const [customEndDate, setCustomEndDate] = useState(new Date().toISOString().split('T')[0]);
 
+  const reportWindow = useMemo(
+    () => getReportWindow(dateRange, customStartDate, customEndDate),
+    [dateRange, customStartDate, customEndDate]
+  );
+
   useEffect(() => {
     fetchData();
-  }, [dateRange, customStartDate, customEndDate]);
+  }, [dateRange, customStartDate, customEndDate, sourceFilter]);
 
   const fetchData = async () => {
     setIsLoading(true);
     try {
-      const now = new Date();
-      let startDate = new Date();
+      const { startIso, endIso } = reportWindow;
 
-      if (dateRange === 'custom') {
-        startDate = new Date(customStartDate);
-        startDate.setHours(0, 0, 0, 0);
-        
-        const endDate = new Date(customEndDate);
-        endDate.setHours(23, 59, 59, 999);
-        
-        // Fetch with both start and end dates
-        const { data: transactionsData, error: transactionsError } = await supabase
-          .from('transactions')
-          .select('*, transaction_items(quantity, products(name))')
-          .gte('created_at', startDate.toISOString())
-          .lte('created_at', endDate.toISOString())
-          .order('created_at', { ascending: false });
-          
-        if (transactionsError) throw transactionsError;
-        
-        await processAndSetTransactions(transactionsData, startDate, endDate);
-        setIsLoading(false);
-        return;
-      }
-
-      switch (dateRange) {
-        case 'today':
-          startDate.setHours(0, 0, 0, 0);
-          break;
-        case 'week':
-          startDate.setDate(now.getDate() - 7);
-          break;
-        case 'month':
-          startDate.setMonth(now.getMonth() - 1);
-          break;
-        case 'year':
-          startDate.setFullYear(now.getFullYear() - 1);
-          break;
-      }
-
-      const { data: transactionsData, error: transactionsError } = await supabase
+      let query = supabase
         .from('transactions')
-        .select('*, transaction_items(quantity, products(name))')
-        .gte('created_at', startDate.toISOString())
-        .order('created_at', { ascending: false });
+        .select('*, transaction_items(quantity, item_name, products(name))')
+        .eq('status', 'completed')
+        .is('voided_at', null)
+        .gte('transaction_date', startIso);
+
+      if (endIso) query = query.lte('transaction_date', endIso);
+      if (sourceFilter !== 'combined') query = query.eq('source', sourceFilter);
+
+      const { data: transactionsData, error: transactionsError } = await query
+        .order('transaction_date', { ascending: false })
+        .limit(500);
 
       if (transactionsError) throw transactionsError;
 
-      await processAndSetTransactions(transactionsData, startDate);
+      const startDate = new Date(startIso);
+      await processAndSetTransactions(
+        transactionsData,
+        startDate,
+        endIso ? new Date(endIso) : undefined
+      );
     } catch (error) {
       console.error('Error fetching report data:', error);
     } finally {
@@ -153,10 +183,18 @@ export default function Reports() {
       const isTerm = t.payment_method === 'term';
       const downPayment = Number(t.down_payment || 0);
       if (isTerm && downPayment <= 0) continue;
+
+      // Manual entries have no cashier_id by design; attribute them to the
+      // cashier who keyed them in so the column never reads "System".
+      const attributedTo = t.source === 'manual' ? t.recorded_by_cashier_id : t.cashier_id;
+
       rows.push({
         ...t,
         total_amount: isTerm ? downPayment : Number(t.total_amount || 0),
-        cashier: { email: cashierMap.get(t.cashier_id) || 'System' }
+        source: t.source || 'register',
+        transaction_date: t.transaction_date || t.created_at,
+        cashier: { email: cashierMap.get(attributedTo) || 'System' },
+        customer_name: t.customer_id ? customerMap.get(t.customer_id) || 'Unknown' : t.customer_name
       });
     }
 
@@ -168,14 +206,25 @@ export default function Reports() {
         payment_method: 'downpayment',
         status: 'completed',
         created_at: p.created_at,
+        transaction_date: p.created_at,
+        source: 'register',
         cashier: { email: cashierMap.get(p.cashier_id) || 'System' },
         customer_name: customerMap.get(p.customer_id) || 'Unknown',
         is_down_payment: true
       });
     }
 
-    return rows.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    return rows.sort((a, b) => new Date(b.transaction_date || b.created_at).getTime() - new Date(a.transaction_date || a.created_at).getTime());
   };
+
+  const getItemLabel = (item: { quantity: number; item_name?: string; products?: { name: string } }) => {
+    // Manual book lines can be free text with no linked product, so item_name is
+    // the only reliable label for those.
+    const name = item.item_name || item.products?.name || 'Item';
+    return `${item.quantity}x ${name}`;
+  };
+
+  const getTransactionDate = (t: Transaction) => t.transaction_date || t.created_at;
 
   const stats = useMemo(() => {
     const totalSales = transactions.reduce((sum, t) => sum + Number(t.total_amount || 0), 0);
@@ -186,6 +235,10 @@ export default function Reports() {
       return amount > max ? amount : max;
     }, 0);
 
+    const registerSales = transactions.reduce((sum, t) => sum + (t.source === 'manual' ? 0 : Number(t.total_amount || 0)), 0);
+    const manualSales = transactions.reduce((sum, t) => sum + (t.source === 'manual' ? Number(t.total_amount || 0) : 0), 0);
+    const manualCount = transactions.filter((t) => t.source === 'manual').length;
+
     // Payment method breakdown
     const methods = transactions.reduce((acc, t) => {
       const amount = Number(t.total_amount || 0);
@@ -193,7 +246,7 @@ export default function Reports() {
       return acc;
     }, {} as Record<string, number>);
 
-    return { totalSales, count, avg, highest, methods };
+    return { totalSales, count, avg, highest, methods, registerSales, manualSales, manualCount };
   }, [transactions]);
 
   const formatDate = (dateString: string) => {
@@ -208,7 +261,9 @@ export default function Reports() {
     switch (method.toLowerCase()) {
       case 'cash': return <Banknote className="h-4 w-4 mr-1" />;
       case 'gcash':
+      case 'mobile': return <Smartphone className="h-4 w-4 mr-1" />;
       case 'card': return <CreditCard className="h-4 w-4 mr-1" />;
+      case 'cheque': return <ScrollText className="h-4 w-4 mr-1" />;
       case 'term': return <CalendarDays className="h-4 w-4 mr-1" />;
       case 'downpayment':
       case 'term_payment': return <HandCoins className="h-4 w-4 mr-1" />;
@@ -218,17 +273,17 @@ export default function Reports() {
 
   const exportToCSV = () => {
     if (transactions.length === 0) return;
-    
-    // Define headers
-    const headers = ['Date', 'Cashier', 'Products', 'Payment Method', 'Total Amount', 'Status'];
-    
-    // Format data
+
+    const headers = ['Date', 'Source', 'BIR Serial', 'Cashier', 'Products', 'Payment Method', 'Total Amount', 'Status'];
+
     const rows = transactions.map(t => [
-      new Date(t.created_at).toLocaleString(),
+      new Date(getTransactionDate(t)).toLocaleString(),
+      t.source === 'manual' ? 'Manual Book' : 'Register',
+      t.manual_ref || '',
       t.cashier?.email || 'System',
       t.is_down_payment
         ? `Downpayment from ${t.customer_name || 'Unknown'}`
-        : t.transaction_items?.map((item) => `${item.quantity}x ${item.products?.name || 'Unknown'}`).join('; ') || '',
+        : t.transaction_items?.map(getItemLabel).join('; ') || '',
       t.payment_method,
       t.total_amount.toString(),
       t.status || 'Completed'
@@ -300,6 +355,36 @@ export default function Reports() {
         </div>
       </div>
 
+      {/* Source filter: register vs manual book vs combined */}
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 bg-white dark:bg-gray-900 px-6 py-4 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-800">
+        <div>
+          <p className="text-sm font-black flex items-center gap-2">
+            <Layers className="h-4 w-4 text-muted-foreground" />
+            Sales Source
+          </p>
+          <p className="text-[11px] text-muted-foreground mt-0.5">
+            Manual book entries are dated by their BIR receipt date.
+          </p>
+        </div>
+        <div className="flex bg-gray-100 dark:bg-gray-800 p-1 rounded-xl self-start">
+          {([
+            { key: 'register', label: 'Register' },
+            { key: 'manual', label: 'Manual Book' },
+            { key: 'combined', label: 'Combined' },
+          ] as const).map(s => (
+            <Button
+              key={s.key}
+              variant={sourceFilter === s.key ? 'default' : 'ghost'}
+              size="sm"
+              onClick={() => setSourceFilter(s.key)}
+              className={`rounded-lg ${sourceFilter === s.key ? 'shadow-sm' : ''}`}
+            >
+              {s.label}
+            </Button>
+          ))}
+        </div>
+      </div>
+
       {/* Stats Grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
         <StatCard
@@ -307,8 +392,8 @@ export default function Reports() {
           value={formatPrice(stats.totalSales)}
           icon={<DollarSign className="h-5 w-5 text-green-500" />}
           loading={isLoading}
-          trend="+12.5% from last period" // Mock trend
-          trendColor="text-green-500"
+          trend={`Register ${formatPrice(stats.registerSales)} · Manual ${formatPrice(stats.manualSales)}`}
+          trendColor="text-muted-foreground"
         />
         <StatCard
           title="Transactions"
@@ -354,6 +439,7 @@ export default function Reports() {
                   <TableHeader className="bg-gray-50 dark:bg-gray-900/50">
                     <TableRow>
                       <TableHead className="w-[180px]">Date & Time</TableHead>
+                      <TableHead className="w-[110px]">Source</TableHead>
                       <TableHead>Cashier</TableHead>
                       <TableHead>Products</TableHead>
                       <TableHead>Payment Method</TableHead>
@@ -364,7 +450,25 @@ export default function Reports() {
                     {transactions.slice(0, 50).map((t) => (
                       <TableRow key={t.id} className="hover:bg-gray-50/50 dark:hover:bg-gray-800/50 transition-colors">
                         <TableCell className="font-medium text-gray-600 dark:text-gray-400">
-                          {formatDate(t.created_at)}
+                          {formatDate(getTransactionDate(t))}
+                        </TableCell>
+                        <TableCell>
+                          {t.source === 'manual' ? (
+                            <Badge
+                              variant="outline"
+                              className="text-amber-700 border-amber-300 bg-amber-50 dark:bg-amber-900/20 dark:text-amber-300 dark:border-amber-800 text-[10px] font-black uppercase"
+                              title={t.manual_ref ? `BIR ${t.manual_ref}` : undefined}
+                            >
+                              Manual
+                            </Badge>
+                          ) : (
+                            <Badge
+                              variant="outline"
+                              className="text-blue-700 border-blue-300 bg-blue-50 dark:bg-blue-900/20 dark:text-blue-300 dark:border-blue-800 text-[10px] font-black uppercase"
+                            >
+                              Register
+                            </Badge>
+                          )}
                         </TableCell>
                         <TableCell>
                           <div className="flex items-center gap-2">
@@ -380,8 +484,11 @@ export default function Reports() {
                               <span className="font-bold text-gray-700 dark:text-gray-300">Downpayment from</span> {t.customer_name}
                             </div>
                           ) : (
-                            <div className="text-xs text-gray-500 max-w-[200px] truncate" title={t.transaction_items?.map(ti => `${ti.quantity}x ${ti.products?.name || 'Item'}`).join(', ') || ''}>
-                              {t.transaction_items?.map(ti => `${ti.quantity}x ${ti.products?.name || 'Item'}`).join(', ') || '-'}
+                            <div
+                              className="text-xs text-gray-500 max-w-[200px] truncate"
+                              title={t.transaction_items?.map(getItemLabel).join(', ') || ''}
+                            >
+                              {t.transaction_items?.map(getItemLabel).join(', ') || '-'}
                             </div>
                           )}
                         </TableCell>
@@ -484,6 +591,9 @@ export default function Reports() {
           </Card>
         </div>
       </div>
+
+      {/* Down Payments monitor */}
+      <DownpaymentsSection period={reportWindow} onRecorded={fetchData} />
     </div>
   );
 }
